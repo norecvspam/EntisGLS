@@ -6,11 +6,13 @@
   Copyright (C) 2002-2004 Leshade Entis, Entis-soft; C# port by morkt)
 MIT 라이선스 고지는 LICENSE-GARbro.txt 참고. 이 파일은 위 C# 구현을 Python/numpy로 옮긴 것이다.
 
-지원: transformation 0x03020000(Lossless), architecture -1(RunlengthGamma), RGB/RGBA/Gray, 8/24/32bpp
-미지원(예외 발생): Huffman/Nemesis/Arithmetic 아키텍처, 손실(DCT/LOT) 변환, 'reference-file' 차분 이미지
+지원: transformation 0x03020000(Lossless), architecture -1(RunlengthGamma) / -4(RunlengthHuffman, ERI v0x20200),
+      RGB/RGBA/Gray, 8/24/32bpp, 'reference-file' 차분 이미지(resolver 콜백 필요)
+미지원(예외 발생): Nemesis/Arithmetic 아키텍처, 손실(DCT/LOT) 변환
 """
 import struct
 import numpy as np
+import mio          # ERINA Huffman (MIO 와 공용)
 
 CV_LOSSLESS_ERI = 0x03020000
 ARCH_GAMMA, ARCH_HUFFMAN, ARCH_NEMESIS, ARCH_ARITH = -1, -4, -16, 32
@@ -19,6 +21,48 @@ T_RGB, T_GRAY, T_RGBA = 0x1, 0x2, 0x04000001
 
 class EriError(Exception):
     pass
+
+
+class _Huff(mio.HuffmanContext):
+    """ERI 용 HuffmanDecodeContext: 생성 직후 flags=0 (PrepareToDecodeERINACode 전에 연산코드를 읽을 때 사용)"""
+
+    def __init__(self):
+        super().__init__()
+        self.flags = 0
+
+    def code(self, tree):
+        return self._code(tree, False)
+
+
+def parse_tags(desc):
+    """GARbro ParseTagInfo: '#tag' 줄 다음에 오는 값 줄들을 모아 {tag: value} 로 반환"""
+    tags = {}
+    if not desc:
+        return tags
+    desc = desc.replace('\0', '')
+    if desc[0] != '#':
+        tags['comment'] = desc
+        return tags
+    lines = desc.splitlines()
+    i = 0
+    import re
+    while i < len(lines):
+        m = re.match(r'^\s*#\s*(\S+)', lines[i])
+        if not m:
+            break
+        tag = m.group(1)
+        val = []
+        i += 1
+        while i < len(lines):
+            ln = lines[i]
+            if ln.startswith('#'):
+                if len(ln) < 2 or ln[1] != '#':
+                    break
+                ln = ln[1:]
+            val.append(ln)
+            i += 1
+        tags[tag] = '\n'.join(val)
+    return tags
 
 
 class EriInfo:
@@ -145,7 +189,7 @@ class Bits:
             base <<= 1
 
     def decode_gamma_bytes(self, out, count):
-        """RLEDecodeContext.DecodeGammaCodeBytes. out: int 리스트(길이>=count). 반환: 디코드한 개수"""
+        """RLEDecodeContext.DecodeGammaCodeBytes. out: int16/int 리스트(길이>=count). 반환: 디코드한 개수"""
         dst = 0
         decoded = 0
         if self.length == 0:
@@ -210,17 +254,25 @@ def _arrange_tables(bs, ch):
     return t
 
 
-def decode(data):
-    """ERI 파일 바이트 → (info, ndarray[H, W, C] uint8, 채널 순서 B,G,R(,A) 또는 Gray)"""
+def decode(data, resolver=None, _depth=0):
+    """ERI 파일 바이트 → (info, ndarray[H, W, C] uint8, 채널 순서 B,G,R(,A) 또는 Gray)
+
+    resolver(name) -> bytes : 'reference-file' 차분 이미지가 참조하는 ERI 를 돌려주는 콜백 (같은 아카이브/폴더 기준)
+    """
     info = read_info(data)
     if info.transformation != CV_LOSSLESS_ERI:
         raise EriError('unsupported transformation 0x%08X (lossy ERI)' % info.transformation)
-    if info.architecture != ARCH_GAMMA:
-        raise NotImplementedError('architecture %d not implemented (only RunlengthGamma)' % info.architecture)
+    if info.architecture not in (ARCH_GAMMA, ARCH_HUFFMAN):
+        raise NotImplementedError('architecture %d not implemented (Gamma/Huffman only)' % info.architecture)
     if info.blocking_degree == 0:
         raise EriError('bad blocking degree')
-    if info.description and 'reference-file' in info.description:
-        raise NotImplementedError('reference-file (delta image) not implemented')
+    arch = info.architecture
+    if arch == ARCH_HUFFMAN and info.version != 0x00020200:
+        raise NotImplementedError('Huffman ERI with ImageInf version 0x%X' % info.version)
+    ref_name = ''
+    tags = parse_tags(info.description)
+    if 'reference-file' in tags:
+        ref_name = tags['reference-file'].strip()
     ftype = info.format_type & 0xFFFF
     if ftype == 1:
         ch = 1 if info.bpp <= 8 else (3 if not (info.format_type & 0x04000000) else 4)
@@ -251,13 +303,24 @@ def decode(data):
     if bpp not in (8, 24, 32):
         raise NotImplementedError('bpp %d' % bpp)
 
+    ctx = optree = None
+    if arch == ARCH_HUFFMAN:
+        ctx = _Huff()
+        ctx.attach(br)
+        optree = mio.HTree()
     ops = None
     if (fenc & 1) and ch >= 3:
-        ops = [br.nbits(4) | 0xC0 for _ in range(wb * hb)]
+        if arch == ARCH_GAMMA:
+            ops = [br.nbits(4) | 0xC0 for _ in range(wb * hb)]
+        else:
+            ops = [ctx.code(optree) & 0xFF for _ in range(wb * hb)]
     if br.abit() != 0:
         raise EriError('bad stream (first bit)')
-    if fenc & 1:
-        br.init_gamma()
+    if arch == ARCH_GAMMA:
+        if fenc & 1:
+            br.init_gamma()
+    else:
+        ctx.prepare()
 
     out = np.zeros((H, W, ch), dtype=np.uint8)
     linebuf = np.zeros(ch * wb * bs, dtype=np.int8)
@@ -275,14 +338,17 @@ def decode(data):
             if ch >= 3:
                 if fenc & 1:
                     op = ops[opi]; opi += 1
+                elif arch == ARCH_HUFFMAN:
+                    op = ctx.code(optree) & 0xFF
                 else:
                     op = br.nbits(4) | 0xC0
                     br.init_gamma()
             else:
                 op = 0xC0 if ftype == 2 else 0
-                if not (fenc & 1):
+                if not (fenc & 1) and arch == ARCH_GAMMA:
                     br.init_gamma()
-            if br.decode_gamma_bytes(arr, S) < S:
+            got = br.decode_gamma_bytes(arr, S) if arch == ARCH_GAMMA else ctx.decode_bytes(arr, S)
+            if got < S:
                 raise EriError('truncated stream at block (%d,%d)' % (px, py))
             a = np.array(arr, dtype=np.int8)
             cop, arr_code, diff = op & 0x0F, (op >> 4) & 3, (op >> 6) & 3
@@ -338,6 +404,22 @@ def decode(data):
                 out[ys - dh + 1:ys + 1, x0:x0 + dw, :] = piece[::-1]
             left_w -= bs
         left_h -= bs
+    if ref_name:
+        if ch < 3:
+            raise EriError('reference-file on a non-color image')
+        if resolver is None:
+            raise NotImplementedError('image needs reference file %r (pass resolver=)' % ref_name)
+        if _depth > 8:
+            raise EriError('reference chain too deep')
+        rdata = resolver(ref_name)
+        if rdata is None:
+            raise FileNotFoundError('referenced image not found: %s' % ref_name)
+        rinfo, rimg = decode(rdata, resolver, _depth + 1)
+        h = min(out.shape[0], rimg.shape[0]); w = min(out.shape[1], rimg.shape[1])
+        out[:h, :w, :3] += rimg[:h, :w, :3]                      # uint8 래핑 덧셈 (원본: byte 덧셈)
+        if out.shape[2] == 4 and rimg.shape[2] == 4:
+            out[:h, :w, 3] += rimg[:h, :w, 3]
+        info.reference = ref_name
     return info, out
 
 
@@ -352,10 +434,25 @@ def to_png(info, img, path):
         Image.fromarray(np.ascontiguousarray(rgba), 'RGBA').save(path)
 
 
+def dir_resolver(directory):
+    """같은 폴더에서 (대소문자 무시) 참조 파일을 찾는 resolver. 확장자가 없으면 .eri 를 붙여 본다."""
+    import os
+    names = {n.lower(): n for n in os.listdir(directory)}
+
+    def resolve(name):
+        for cand in (name, name + '.eri'):
+            n = names.get(cand.lower())
+            if n:
+                return open(os.path.join(directory, n), 'rb').read()
+        return None
+    return resolve
+
+
 if __name__ == '__main__':
-    import sys, time
+    import sys, time, os
     src, dst = sys.argv[1], sys.argv[2]
+    ref_dir = sys.argv[sys.argv.index('--ref-dir') + 1] if '--ref-dir' in sys.argv else os.path.dirname(os.path.abspath(src))
     t = time.time()
-    info, img = decode(open(src, 'rb').read())
+    info, img = decode(open(src, 'rb').read(), dir_resolver(ref_dir))
     to_png(info, img, dst)
     print(f'{src}: {info.width}x{info.height} bpp={info.bpp} block={1 << info.blocking_degree} -> {dst} ({time.time() - t:.1f}s)')

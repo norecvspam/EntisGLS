@@ -8,8 +8,9 @@
 사용법
   python noa.py list    system.noa [-r]          # -r: 중첩 NOA까지 풀어서 재귀 목록
   python noa.py extract system.noa OUTDIR [-r]   # 파일 추출 (-r: 중첩 NOA를 폴더로 펼침)
+  python noa.py extract bs.noa OUT --only 'kdu_aaa*' --only 'kdu_aab*'   # 이름 패턴(fnmatch, 대소문자 무시)에 맞는 것만
 """
-import argparse, mmap, os, struct, sys
+import argparse, fnmatch, mmap, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import erisa_nemesis
 
@@ -21,11 +22,24 @@ class Entry:
     __slots__ = ('name', 'size', 'attr', 'enc', 'blk', 'ts', 'extra')
 
 
-def read_dir(buf, base=0, encoding='cp932', cur=''):
-    """buf[base:] 가 'Entis' 헤더로 시작하는 NOA 라고 가정하고 디렉터리를 파싱한다."""
+AUTO_ENCODINGS = ('utf-8', 'cp932', 'cp949')
+
+
+def read_dir(buf, base=0, encoding='auto', cur=''):
+    """buf[base:] 가 'Entis' 헤더로 시작하는 NOA 라고 가정하고 디렉터리를 파싱한다.
+    encoding='auto' : utf-8 → cp932 → cp949 순으로 '모든 이름이 엄격하게 디코드되는' 첫 인코딩을 쓴다
+    (한글패치 도구가 시스템 코드페이지(cp949)로 이름을 저장한 아카이브가 있음: 1화 script.noa)."""
     if bytes(buf[base:base + 5]) != b'Entis':
         raise ValueError('not an Entis container')
-    return _parse_dir(buf, base, base + 0x40, encoding, cur)
+    if encoding != 'auto':
+        return _parse_dir(buf, base, base + 0x40, encoding, cur)
+    last = None
+    for enc in AUTO_ENCODINGS:
+        try:
+            return _parse_dir(buf, base, base + 0x40, enc, cur)
+        except UnicodeDecodeError as ex:
+            last = ex
+    raise last
 
 
 def _parse_dir(buf, base, d, encoding, cur):
@@ -76,20 +90,30 @@ def read_entry(buf, e):
     raise NotImplementedError(f'{e.name}: 암호화 방식 {ENC_NAMES.get(e.enc, hex(e.enc))} 미구현')
 
 
-def walk(buf, recursive, depth=0, prefix='', on_file=None, encoding='cp932'):
+def _match(name, only):
+    if not only:
+        return True
+    base = name.rsplit('/', 1)[-1].lower()
+    return any(fnmatch.fnmatch(base, pat.lower()) for pat in only)
+
+
+def walk(buf, recursive, depth=0, prefix='', on_file=None, encoding='auto', only=None):
     for e in read_dir(buf, 0, encoding):
         stored = stored_size(buf, e)
         mode = {ENC_RAW: '-', ENC_ERISA: 'C'}.get(e.enc, '?')
         line = '  ' * depth + f'[{mode}] {e.name}  size={e.size} stored={stored} enc=0x{e.enc:08X} attr=0x{e.attr:X}'
-        print(line)
-        if on_file:
+        is_nested = recursive and e.name.lower().endswith('.noa')
+        wanted = _match(e.name, only)
+        if wanted or is_nested:
+            print(line)
+        if on_file and wanted:
             on_file(prefix + e.name, e, buf)
         if recursive and e.name.lower().endswith('.noa'):
             try:
                 inner = read_entry(buf, e)
             except Exception as ex:
                 print('  ' * (depth + 1) + f'(재귀 실패: {ex})'); continue
-            walk(memoryview(inner), True, depth + 1, prefix + e.name + '/', on_file, encoding)
+            walk(memoryview(inner), True, depth + 1, prefix + e.name + '/', on_file, encoding, only)
 
 
 def main():
@@ -97,7 +121,8 @@ def main():
     ap.add_argument('cmd', choices=['list', 'extract'])
     ap.add_argument('archive'); ap.add_argument('outdir', nargs='?')
     ap.add_argument('-r', '--recursive', action='store_true')
-    ap.add_argument('--encoding', default='cp932')
+    ap.add_argument('--only', action='append', help='이름 패턴(fnmatch)에 맞는 파일만 처리 (여러 번 지정 가능)')
+    ap.add_argument('--encoding', default='auto', help="이름 인코딩 (기본 auto: utf-8/cp932/cp949 자동 판별)")
     a = ap.parse_args()
     with open(a.archive, 'rb') as f:
         buf = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -111,7 +136,7 @@ def main():
                     o.write(read_entry(b, e))
             except Exception as ex:
                 print('   !! 건너뜀:', ex)
-        walk(buf, a.recursive, on_file=extract if a.cmd == 'extract' else None, encoding=a.encoding)
+        walk(buf, a.recursive, on_file=extract if a.cmd == 'extract' else None, encoding=a.encoding, only=a.only)
 
 
 if __name__ == '__main__':
